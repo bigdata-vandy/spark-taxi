@@ -113,13 +113,13 @@ object TaxiApp {
                        )
 
   def customRound(d: Double, p: Int): Double =
+    // 10m = 0.00009 degrees latitude
+    // 10m = 0.00012 degrees longitude
     scala.math.BigDecimal(d)
         .setScale(p, BigDecimal.RoundingMode.HALF_UP).toDouble
 
   final case class Point(lng: Double, lat: Double) {
     def round = Point(customRound(lng, 4), customRound(lat, 4))
-
-    def key: (Double, Double) = (lng, lat)
   }
 
 
@@ -145,7 +145,8 @@ object TaxiApp {
     // For implicit conversions like converting RDDs to DataFrames
     // import spark.implicits._
     val df: DataFrame = spark.read
-        .option("header", "true")
+        .option("header", true)
+        .option("treatEmptyValuesAsNulls", true)
         .schema(customSchema)
         .csv(inputPaths: _*)
 
@@ -156,30 +157,80 @@ object TaxiApp {
 
     val pointsRDD: RDD[Row] =
       df.select(columns.head, columns.tail: _*).rdd
+          .filter {
+            case Row(0.0, _, _, _) => false
+            case Row(_, 0.0, _, _) => false
+            case Row(_, _, 0.0, _) => false
+            case Row(_, _, _, 0.0) => false
+            case Row(_: Double, _: Double, _: Double, _: Double) =>
+              true
+            case _ => false
+          }
           .map {
             case Row(pLng: Double, pLat: Double, dLng: Double, dLat: Double)
           => Row(Point(pLng, pLat).round, Point(dLng, dLat).round)
           }
-          .persist(StorageLevel.MEMORY_AND_DISK)
 
     // Give each point a unique id
     val indexed: RDD[(Point, Long)] =
-      pointsRDD.map{ case Row(a: Point, b: Point) => Seq(a, b) }
+      pointsRDD.map{ case Row(a: Point, b: Point) => Seq(a.round, b.round) }
           .flatMap(p => p).distinct.zipWithUniqueId
+          .persist(StorageLevel.MEMORY_AND_DISK)
 
-    pointsRDD.keyBy[Point]{ case Row(a: Point, b: Point) => a } take 10 foreach println
+    // Join the pickup with its index
+    val pickups = pointsRDD.keyBy[Point]{
+      case Row(a: Point, b: Point) => a.round }.join(indexed)
 
+    // Construct the edges
+    // Join the dropoff with it's index
+    val edges: RDD[Edge[String]] = pickups.map {
+      case (_, (Row(_: Point, p1: Point), v0: Long)) =>
+        (p1.round, v0)
+    } .join(indexed).values
+        .map { case (v0: Long, v1: Long) => Edge(v0, v1, "foo") }
+
+    // Reformat indexed to be vertices
+    val vertices: RDD[(VertexId, Point)] = indexed.map({
+      case (p: Point, v: Long) => (v, p)
+    })
+
+    // Specify default point
     val defaultPoint = Point(-1.0, -1.0)
 
-    // Edge()
-    /*
-    val trips: RDD[Edge[String]] =
+    // Create the graph
+    val graph = Graph(vertices, edges, defaultPoint)
 
-    val graph = Graph.fromEdges()
-    */
+    // Run PageRank
+    val ranks = graph pageRank 0.0001 vertices
 
-    // 10m = 0.00009 degrees latitude
-    // 10m = 0.00012 degrees longitude
+    ranks take 10 foreach println
+
+    // Map to Row and sort the page ranks descending
+    val sorted = ranks.join(vertices).map(
+      { case (_: VertexId, (v: Double, p: Point)) => Row(p.lng, p.lat, v) }
+    ).sortBy[Double](
+      { case Row(_: Double, _: Double, rank: Double) => rank },
+      ascending = false
+    )
+
+
+    // Convert RDD to DataFrame
+
+    // Generate the schema based on the string of schema
+    val pageRankSchema = StructType(Array(
+      StructField("longitude",   DoubleType,  nullable = false),
+      StructField("latitude",    DoubleType,  nullable = false),
+      StructField("pagerank",    DoubleType,  nullable = false)
+    ))
+
+    val sortedDF = spark.createDataFrame(sorted, pageRankSchema)
+
+    // Write the DataFrame to disk
+    sortedDF.write
+        .format("com.databricks.spark.csv")
+        .option("header", true)
+        .save("location_ranks")
+
 
   }
 }
